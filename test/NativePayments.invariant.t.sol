@@ -72,6 +72,8 @@ contract NativePaymentsHandler is Test {
     }
 }
 
+/// @dev The handler bounds every input to a valid call, so any revert is a regression.
+/// forge-config: default.invariant.fail-on-revert = true
 contract NativePaymentsInvariantTest is Test {
     NativePayments private payments;
     NativePaymentsHandler private handler;

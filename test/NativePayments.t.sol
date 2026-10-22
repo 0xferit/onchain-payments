@@ -71,6 +71,12 @@ contract NativePaymentsTest is Test {
     address private alice = makeAddr("alice");
     address private bob = makeAddr("bob");
 
+    /// @dev The required event layouts, declared independently of the contract so that a change
+    /// to which fields are indexed fails `expectEmit` instead of moving the expectation with it.
+    event Deposited(address indexed sender, uint256 amount);
+    event Payment(address indexed payer, string orderCode, uint256 amount);
+    event Withdrawn(address indexed account, uint256 amount);
+
     function setUp() public {
         payments = new NativePayments(merchant);
     }
@@ -115,7 +121,7 @@ contract NativePaymentsTest is Test {
     function test_Receive_CreditsSenderAndEmitsDeposited() public {
         vm.deal(alice, 3 ether);
         vm.expectEmit(address(payments));
-        emit NativePayments.Deposited(alice, 3 ether);
+        emit Deposited(alice, 3 ether);
         vm.prank(alice);
         (bool deposited,) = address(payments).call{value: 3 ether}("");
 
@@ -127,6 +133,9 @@ contract NativePaymentsTest is Test {
 
     function test_Receive_AccumulatesRepeatedDeposits() public {
         _deposit(alice, 1 ether);
+
+        vm.expectEmit(address(payments));
+        emit Deposited(alice, 2 ether);
         _deposit(alice, 2 ether);
 
         assertEq(payments.credit(alice), 3 ether);
@@ -138,13 +147,23 @@ contract NativePaymentsTest is Test {
         payable(address(payments)).transfer(1 ether);
     }
 
+    function test_Receive_RejectsValueWithUnknownCalldata() public {
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        (bool accepted,) = address(payments).call{value: 1 ether}(hex"deadbeef");
+
+        assertFalse(accepted);
+        assertEq(payments.credit(alice), 0);
+        assertEq(address(payments).balance, 0);
+    }
+
     // Payments
 
     function test_Pay_FundedEntirelyByCredit() public {
         _deposit(alice, 3 ether);
 
         vm.expectEmit(address(payments));
-        emit NativePayments.Payment(alice, ORDER, 2 ether);
+        emit Payment(alice, ORDER, 2 ether);
         _pay(alice, ORDER, 0, 2 ether);
 
         assertEq(payments.credit(alice), 1 ether);
@@ -155,7 +174,7 @@ contract NativePaymentsTest is Test {
 
     function test_Pay_FundedEntirelyByValue() public {
         vm.expectEmit(address(payments));
-        emit NativePayments.Payment(alice, ORDER, 2 ether);
+        emit Payment(alice, ORDER, 2 ether);
         _pay(alice, ORDER, 2 ether, 2 ether);
 
         assertEq(payments.credit(alice), 0);
@@ -168,7 +187,7 @@ contract NativePaymentsTest is Test {
         _deposit(alice, 1 ether);
 
         vm.expectEmit(address(payments));
-        emit NativePayments.Payment(alice, ORDER, 3 ether);
+        emit Payment(alice, ORDER, 3 ether);
         _pay(alice, ORDER, 2 ether, 3 ether);
 
         assertEq(payments.credit(alice), 0);
@@ -213,7 +232,13 @@ contract NativePaymentsTest is Test {
 
     function test_Pay_AccumulatesRepeatedPaymentsPerOrder() public {
         _pay(alice, ORDER, 1 ether, 1 ether);
+
+        vm.expectEmit(address(payments));
+        emit Payment(alice, ORDER, 2 ether);
         _pay(alice, ORDER, 2 ether, 2 ether);
+
+        vm.expectEmit(address(payments));
+        emit Payment(bob, ORDER, 3 ether);
         _pay(bob, ORDER, 3 ether, 3 ether);
 
         assertEq(payments.orderPayments(ORDER), 6 ether);
@@ -222,14 +247,14 @@ contract NativePaymentsTest is Test {
     }
 
     function test_Pay_MerchantAsPayerKeepsOwnCredit() public {
-        _pay(alice, OTHER_ORDER, 2 ether, 2 ether);
+        _pay(alice, ORDER, 2 ether, 2 ether);
 
         vm.expectEmit(address(payments));
-        emit NativePayments.Payment(merchant, ORDER, 3 ether);
+        emit Payment(merchant, ORDER, 3 ether);
         _pay(merchant, ORDER, 1 ether, 3 ether);
 
         assertEq(payments.credit(merchant), 3 ether);
-        assertEq(payments.orderPayments(ORDER), 3 ether);
+        assertEq(payments.orderPayments(ORDER), 5 ether);
         assertEq(address(payments).balance, 3 ether);
 
         _withdraw(merchant, 3 ether);
@@ -243,7 +268,7 @@ contract NativePaymentsTest is Test {
         _deposit(alice, 3 ether);
 
         vm.expectEmit(address(payments));
-        emit NativePayments.Withdrawn(alice, 1 ether);
+        emit Withdrawn(alice, 1 ether);
         _withdraw(alice, 1 ether);
 
         assertEq(payments.credit(alice), 2 ether);
@@ -260,7 +285,7 @@ contract NativePaymentsTest is Test {
         _pay(alice, ORDER, 3 ether, 2 ether);
 
         vm.expectEmit(address(payments));
-        emit NativePayments.Withdrawn(merchant, 1 ether);
+        emit Withdrawn(merchant, 1 ether);
         _withdraw(merchant, 1 ether);
 
         assertEq(payments.credit(merchant), 1 ether);
