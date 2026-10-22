@@ -22,13 +22,15 @@ contract RejectingAccount {
     }
 }
 
-/// @dev Re-enters `withdraw` once from its receive hook and records the outcome.
-contract ReentrantAccount {
+/// @dev Calls back into NativePayments once from its receive hook, with a configurable value
+/// and calldata, and records the outcome. Used to re-enter during `withdraw`.
+contract CallbackAccount {
     NativePayments private immutable PAYMENTS;
-    uint256 private reentryAmount;
-    bool public reentryAttempted;
-    bool public reentrySucceeded;
-    bytes public reentryRevertData;
+    uint256 private callbackValue;
+    bytes private callbackData;
+    bool public callbackAttempted;
+    bool public callbackSucceeded;
+    bytes public callbackRevertData;
 
     constructor(NativePayments payments_) {
         PAYMENTS = payments_;
@@ -39,19 +41,18 @@ contract ReentrantAccount {
         require(deposited);
     }
 
-    function attack(uint256 amount, uint256 reentryAmount_) external {
-        reentryAmount = reentryAmount_;
+    function withdrawWithCallback(uint256 amount, uint256 callbackValue_, bytes calldata callbackData_) external {
+        callbackValue = callbackValue_;
+        callbackData = callbackData_;
         PAYMENTS.withdraw(amount);
     }
 
     receive() external payable {
-        if (reentryAttempted) return;
-        reentryAttempted = true;
-        try PAYMENTS.withdraw(reentryAmount) {
-            reentrySucceeded = true;
-        } catch (bytes memory reason) {
-            reentryRevertData = reason;
-        }
+        if (callbackAttempted) return;
+        callbackAttempted = true;
+        bytes memory result;
+        (callbackSucceeded, result) = address(PAYMENTS).call{value: callbackValue}(callbackData);
+        if (!callbackSucceeded) callbackRevertData = result;
     }
 }
 
@@ -149,6 +150,13 @@ contract NativePaymentsTest is Test {
         assertEq(deployed.merchant(), address(this));
     }
 
+    function test_Constructor_AcceptsDeployingAccountAsMerchant() public {
+        vm.prank(alice, alice);
+        NativePayments deployed = new NativePayments(alice);
+
+        assertEq(deployed.merchant(), alice);
+    }
+
     // Deposits
 
     function test_Receive_CreditsSenderAndEmitsDeposited() public {
@@ -180,12 +188,14 @@ contract NativePaymentsTest is Test {
         payable(address(payments)).transfer(1 ether);
     }
 
-    function test_Receive_RejectsValueWithUnknownCalldata() public {
+    function test_Receive_RejectsUnknownCalldata() public {
         vm.deal(alice, 1 ether);
         vm.prank(alice);
-        (bool accepted,) = address(payments).call{value: 1 ether}(hex"deadbeef");
+        (bool acceptedWithValue,) = address(payments).call{value: 1 ether}(hex"deadbeef");
+        (bool acceptedWithoutValue,) = address(payments).call(hex"deadbeef");
 
-        assertFalse(accepted);
+        assertFalse(acceptedWithValue);
+        assertFalse(acceptedWithoutValue);
         assertEq(payments.credit(alice), 0);
         assertEq(address(payments).balance, 0);
     }
@@ -288,6 +298,20 @@ contract NativePaymentsTest is Test {
 
         assertEq(payments.orderPayments(first), 1 ether);
         assertEq(payments.orderPayments(second), 2 ether);
+    }
+
+    function test_Pay_TreatsOrderCodesAsExactBytes() public {
+        _pay(alice, "order-a", 1 ether, 1 ether);
+        _pay(alice, "ORDER-A", 2 ether, 2 ether);
+
+        assertEq(payments.orderPayments("order-a"), 1 ether);
+        assertEq(payments.orderPayments("ORDER-A"), 2 ether);
+    }
+
+    function test_Pay_MerchantRevertsOnInsufficientFunds() public {
+        vm.expectRevert(abi.encodeWithSelector(NativePayments.InsufficientFunds.selector, 0, 1 ether));
+        vm.prank(merchant);
+        payments.pay(ORDER, 1 ether);
     }
 
     function test_Pay_EmitsOnlyPayment() public {
@@ -393,15 +417,15 @@ contract NativePaymentsTest is Test {
 
     function test_Withdraw_ReentryCannotWithdrawUncreditedFunds() public {
         _deposit(bob, 5 ether);
-        ReentrantAccount attacker = new ReentrantAccount(payments);
+        CallbackAccount attacker = new CallbackAccount(payments);
         attacker.deposit{value: 1 ether}();
 
-        attacker.attack(1 ether, 1 ether);
+        attacker.withdrawWithCallback(1 ether, 0, abi.encodeCall(NativePayments.withdraw, (1 ether)));
 
-        assertTrue(attacker.reentryAttempted());
-        assertFalse(attacker.reentrySucceeded());
+        assertTrue(attacker.callbackAttempted());
+        assertFalse(attacker.callbackSucceeded());
         assertEq(
-            attacker.reentryRevertData(), abi.encodeWithSelector(NativePayments.InsufficientFunds.selector, 0, 1 ether)
+            attacker.callbackRevertData(), abi.encodeWithSelector(NativePayments.InsufficientFunds.selector, 0, 1 ether)
         );
         assertEq(address(attacker).balance, 1 ether);
         assertEq(payments.credit(address(attacker)), 0);
@@ -411,19 +435,70 @@ contract NativePaymentsTest is Test {
 
     function test_Withdraw_ReentryLimitedToRemainingCredit() public {
         _deposit(bob, 5 ether);
-        ReentrantAccount attacker = new ReentrantAccount(payments);
+        CallbackAccount attacker = new CallbackAccount(payments);
         attacker.deposit{value: 2 ether}();
 
-        attacker.attack(1 ether, 2 ether);
+        attacker.withdrawWithCallback(1 ether, 0, abi.encodeCall(NativePayments.withdraw, (2 ether)));
 
-        assertFalse(attacker.reentrySucceeded());
+        assertFalse(attacker.callbackSucceeded());
         assertEq(
-            attacker.reentryRevertData(),
+            attacker.callbackRevertData(),
             abi.encodeWithSelector(NativePayments.InsufficientFunds.selector, 1 ether, 2 ether)
         );
         assertEq(address(attacker).balance, 1 ether);
         assertEq(payments.credit(address(attacker)), 1 ether);
         assertEq(address(payments).balance, 6 ether);
+    }
+
+    function test_Withdraw_SuccessfulReentryAccountsEachWithdrawal() public {
+        _deposit(bob, 5 ether);
+        CallbackAccount account = new CallbackAccount(payments);
+        account.deposit{value: 3 ether}();
+
+        vm.recordLogs();
+        account.withdrawWithCallback(1 ether, 0, abi.encodeCall(NativePayments.withdraw, (1 ether)));
+
+        assertTrue(account.callbackSucceeded());
+        assertEq(address(account).balance, 2 ether);
+        assertEq(payments.credit(address(account)), 1 ether);
+        assertEq(address(payments).balance, 6 ether);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2);
+        for (uint256 i; i < logs.length; ++i) {
+            assertEq(logs[i].topics[0], Withdrawn.selector);
+            assertEq(abi.decode(logs[i].data, (uint256)), 1 ether);
+        }
+    }
+
+    function test_Withdraw_DepositDuringWithdrawalIsCredited() public {
+        CallbackAccount account = new CallbackAccount(payments);
+        account.deposit{value: 2 ether}();
+
+        account.withdrawWithCallback(1 ether, 1 ether, "");
+
+        assertTrue(account.callbackSucceeded());
+        assertEq(payments.credit(address(account)), 2 ether);
+        assertEq(address(payments).balance, 2 ether);
+    }
+
+    function test_Withdraw_PaymentDuringWithdrawalSucceeds() public {
+        CallbackAccount account = new CallbackAccount(payments);
+        account.deposit{value: 2 ether}();
+
+        account.withdrawWithCallback(1 ether, 0, abi.encodeCall(NativePayments.pay, (ORDER, 1 ether)));
+
+        assertTrue(account.callbackSucceeded());
+        assertEq(payments.credit(address(account)), 0);
+        assertEq(payments.credit(merchant), 1 ether);
+        assertEq(payments.orderPayments(ORDER), 1 ether);
+    }
+
+    function test_Withdraw_RevertsOnMaxAmountInsteadOfWithdrawingAll() public {
+        _deposit(alice, 1 ether);
+
+        vm.expectRevert(abi.encodeWithSelector(NativePayments.InsufficientFunds.selector, 1 ether, type(uint256).max));
+        _withdraw(alice, type(uint256).max);
     }
 
     // Isolation and forced funds
