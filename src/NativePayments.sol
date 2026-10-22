@@ -6,7 +6,7 @@ pragma solidity ^0.8.24;
 /// Deposits and order allocation are separate steps: funds sent to `receive` become the
 /// sender's credit, and `pay` moves credit (plus any attached value) to the merchant.
 /// @dev The contract only tracks credit it was told about. Native funds that arrive without
-/// executing `receive` or `pay` (for example via `selfdestruct` or as a block reward) are
+/// executing `receive` or `pay` (for example via `selfdestruct` or as a block's fee recipient) are
 /// never credited to anyone and cannot be withdrawn.
 contract NativePayments {
     /// @notice The address credited with every payment. Fixed at deployment.
@@ -20,8 +20,12 @@ contract NativePayments {
     /// order is fully paid; order terms live off-chain.
     mapping(string => uint256) public orderPayments;
 
+    /// @notice `sender` added `amount` to its credit without assigning it to an order.
     event Deposited(address indexed sender, uint256 amount);
+    /// @notice `payer` allocated `amount` to `orderCode`. The order code is deliberately not
+    /// indexed so its text stays readable in the log data.
     event Payment(address indexed payer, string orderCode, uint256 amount);
+    /// @notice `amount` of `account`'s credit was sent to `account`.
     event Withdrawn(address indexed account, uint256 amount);
 
     /// @notice The merchant is the zero address or this contract's own address.

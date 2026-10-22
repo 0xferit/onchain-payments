@@ -17,7 +17,8 @@ The merchant address is fixed at deployment and cannot be the zero address or th
 - **Direct transfers need gas for a storage write.** `receive()` updates storage, so a plain `transfer` or `send` (2300 gas stipend) reverts. Wallets sending an ordinary transaction are fine; contracts must use `call` with enough gas, or use `pay` instead.
 - **Exchange withdrawals credit the exchange.** Credit belongs to `msg.sender`. When a customer withdraws from an exchange directly to this contract, the exchange's hot wallet receives the credit, not the customer, and the customer cannot spend or reclaim it. There is deliberately no claim-by-transaction-hash or `tx.origin` path. Customers should pay from a wallet they control.
 - **No order validation.** The contract accepts any non-empty order code and any non-zero amount. Prices, expiry, duplicates and fulfilment are the backend's job.
-- **Forced funds are stranded.** Native tokens that arrive without executing `receive()` or `pay()` (for example through `selfdestruct` or a block reward) are credited to nobody and cannot be withdrawn. There is no recovery function.
+- **Forced funds are stranded.** Native tokens that arrive without executing `receive()` or `pay()` (for example through `selfdestruct`, or by naming the contract as a block's fee recipient) are credited to nobody and cannot be withdrawn. There is no recovery function.
+- **The merchant must be able to receive native tokens.** The merchant address is immutable and proceeds leave only through `withdraw`, which sends to the caller. If the merchant is a contract that cannot call `withdraw` or rejects native tokens, its proceeds are locked permanently. Use an externally owned account or a wallet contract known to accept native tokens.
 
 ## Development
 
