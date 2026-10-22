@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Unlicense
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {NativePayments} from "../src/NativePayments.sol";
 
 /// @dev Holds credit but has no receive or fallback, so native withdrawals to it fail.
@@ -51,6 +51,33 @@ contract ReentrantAccount {
             reentrySucceeded = true;
         } catch (bytes memory reason) {
             reentryRevertData = reason;
+        }
+    }
+}
+
+/// @dev Spends about 1.3M gas on receipt, like a smart wallet with heavy receive logic.
+contract GasHungryAccount {
+    uint256 private constant SLOTS_WRITTEN_ON_RECEIVE = 60;
+
+    NativePayments private immutable PAYMENTS;
+    mapping(uint256 => uint256) private written;
+
+    constructor(NativePayments payments_) {
+        PAYMENTS = payments_;
+    }
+
+    function deposit() external payable {
+        (bool deposited,) = address(PAYMENTS).call{value: msg.value}("");
+        require(deposited);
+    }
+
+    function withdraw(uint256 amount) external {
+        PAYMENTS.withdraw(amount);
+    }
+
+    receive() external payable {
+        for (uint256 i; i < SLOTS_WRITTEN_ON_RECEIVE; ++i) {
+            written[i] = i + 1;
         }
     }
 }
@@ -114,6 +141,12 @@ contract NativePaymentsTest is Test {
         address deploymentAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectRevert(abi.encodeWithSelector(NativePayments.InvalidMerchant.selector, deploymentAddress));
         new NativePayments(deploymentAddress);
+    }
+
+    function test_Constructor_AcceptsDeployingContractAsMerchant() public {
+        NativePayments deployed = new NativePayments(address(this));
+
+        assertEq(deployed.merchant(), address(this));
     }
 
     // Deposits
@@ -246,6 +279,28 @@ contract NativePaymentsTest is Test {
         assertEq(payments.credit(merchant), 6 ether);
     }
 
+    function test_Pay_KeepsLongOrderCodesWithSharedPrefixDistinct() public {
+        string memory first = "INVOICE-2026-10-22-CUSTOMER-000000000001";
+        string memory second = "INVOICE-2026-10-22-CUSTOMER-000000000002";
+
+        _pay(alice, first, 1 ether, 1 ether);
+        _pay(alice, second, 2 ether, 2 ether);
+
+        assertEq(payments.orderPayments(first), 1 ether);
+        assertEq(payments.orderPayments(second), 2 ether);
+    }
+
+    function test_Pay_EmitsOnlyPayment() public {
+        vm.deal(alice, 3 ether);
+        vm.recordLogs();
+        vm.prank(alice);
+        payments.pay{value: 3 ether}(ORDER, 1 ether);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 1);
+        assertEq(logs[0].topics[0], Payment.selector);
+    }
+
     function test_Pay_MerchantAsPayerKeepsOwnCredit() public {
         _pay(alice, ORDER, 2 ether, 2 ether);
 
@@ -324,6 +379,16 @@ contract NativePaymentsTest is Test {
 
         assertEq(payments.credit(address(account)), 1 ether);
         assertEq(address(payments).balance, 1 ether);
+    }
+
+    function test_Withdraw_ForwardsAllGasToRecipient() public {
+        GasHungryAccount account = new GasHungryAccount(payments);
+        account.deposit{value: 1 ether}();
+
+        account.withdraw(1 ether);
+
+        assertEq(address(account).balance, 1 ether);
+        assertEq(payments.credit(address(account)), 0);
     }
 
     function test_Withdraw_ReentryCannotWithdrawUncreditedFunds() public {
